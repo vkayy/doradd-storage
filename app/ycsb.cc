@@ -34,10 +34,21 @@
     }
 #endif
 
+#ifdef STORAGE_TIER
+struct YCSBRow
+{
+  char* payload;
+  explicit YCSBRow(char* p) : payload(p) {}
+};
+static constexpr size_t COWN_STRIDE = 64;
+static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
+#else
 struct YCSBRow
 {
   char payload[ROW_SIZE];
 };
+static constexpr size_t COWN_STRIDE = 1024;
+#endif
 
 struct __attribute__((packed)) YCSBTransactionMarshalled
 {
@@ -171,15 +182,26 @@ int main(int argc, char** argv)
   YCSBTransaction::index = new Index<YCSBRow>;
   uint64_t cown_prev_addr = 0;
   uint8_t* cown_arr_addr =
-    static_cast<uint8_t*>(aligned_alloc_hpage(1024 * DB_SIZE));
+    static_cast<uint8_t*>(aligned_alloc_hpage(COWN_STRIDE * DB_SIZE));
+#ifdef STORAGE_TIER
+  uint8_t* payload_arr_addr =
+    static_cast<uint8_t*>(aligned_alloc_hpage_lazy((uint64_t)ROW_SIZE * DB_SIZE));
+#endif
 
   for (int i = 0; i < DB_SIZE; i++)
   {
+#ifdef STORAGE_TIER
+    char* payload_ptr =
+      reinterpret_cast<char*>(payload_arr_addr + (uint64_t)ROW_SIZE * i);
     cown_ptr<YCSBRow> cown_r = make_cown_custom<YCSBRow>(
-      reinterpret_cast<void*>(cown_arr_addr + (uint64_t)1024 * i));
+      reinterpret_cast<void*>(cown_arr_addr + COWN_STRIDE * i), payload_ptr);
+#else
+    cown_ptr<YCSBRow> cown_r = make_cown_custom<YCSBRow>(
+      reinterpret_cast<void*>(cown_arr_addr + COWN_STRIDE * i));
+#endif
 
     if (i > 0)
-      assert((cown_r.get_base_addr() - cown_prev_addr) == 1024);
+      assert((cown_r.get_base_addr() - cown_prev_addr) == COWN_STRIDE);
     cown_prev_addr = cown_r.get_base_addr();
 
     YCSBTransaction::index->insert_row(cown_r);

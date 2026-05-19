@@ -145,3 +145,18 @@ void* aligned_alloc_hpage(size_t sz)
   printf("allocated huge pages\n");
   return buf_begin;
 }
+
+void* aligned_alloc_hpage_lazy(size_t sz)
+{
+  size_t hpage_nr = (size_t)(sz / HPAGE_SIZE) + 1;
+  size_t alloc_sz = hpage_nr * HPAGE_SIZE;
+
+  void* buf = aligned_alloc(HPAGE_SIZE, alloc_sz);
+  if (!buf)
+    printf("could not allocate mem: %s\n", strerror(errno));
+
+  madvise(buf, alloc_sz, MADV_HUGEPAGE);
+
+  printf("allocated huge pages (lazy)\n");
+  return buf;
+}
