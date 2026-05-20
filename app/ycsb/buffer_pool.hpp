@@ -67,7 +67,7 @@ public:
   // Releases row, evicting it if buffer pool exceeds threshold
   void release(YCSBRow* row)
   {
-    if (n_resident_.load() > n_slots_ - headroom_)
+    if (n_resident_.load() + headroom_ > n_slots_)
       evict(row);
   }
 
