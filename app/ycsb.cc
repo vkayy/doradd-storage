@@ -2,6 +2,9 @@
 #include "ycsb/db.hpp"
 #include "pipeline.hpp"
 #include "txcounter.hpp"
+#ifdef STORAGE_TIER
+#include "ycsb/buffer_pool.hpp"
+#endif
 
 #include <thread>
 
@@ -10,10 +13,20 @@
     reinterpret_cast<void*>(txm->cown_ptrs[_INDEX]));
 #define GET_ROW(_INDEX) \
   auto&& row##_INDEX = index->get_row(txm->indices[_INDEX]);
+
+#ifdef STORAGE_TIER
+#  define MARK_DIRTY(_INDEX) acq_row##_INDEX->is_dirty = 1
+#else
+#  define MARK_DIRTY(_INDEX) ((void)0)
+#endif
+
 #define TXN(_INDEX) \
   { \
     if (write_set_l & 0x1) \
+    { \
       memset(acq_row##_INDEX->payload, sum, WRITE_SIZE); \
+      MARK_DIRTY(_INDEX); \
+    } \
     else \
     { \
       for (int j = 0; j < ROW_SIZE; j++) \
@@ -35,13 +48,10 @@
 #endif
 
 #ifdef STORAGE_TIER
-struct YCSBRow
-{
-  char* payload;
-  explicit YCSBRow(char* p) : payload(p) {}
-};
 static constexpr size_t COWN_STRIDE = 64;
 static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
+static const char* BACKING_FILE_PATH = "/tmp/ycsb_doradd_payload.bin";
+static constexpr size_t BACKING_FILE_BUDGET_PCT = 80;
 #else
 struct YCSBRow
 {
@@ -59,10 +69,26 @@ struct __attribute__((packed)) YCSBTransactionMarshalled
 };
 static_assert(sizeof(YCSBTransactionMarshalled) == 128);
 
+#ifdef STORAGE_TIER
+template<typename... Acqs>
+inline void buffer_pool_acquire_all(BufferPool* bp, Acqs&... acqs)
+{
+  (bp->acquire(&*acqs), ...);
+}
+template<typename... Acqs>
+inline void buffer_pool_release_all(BufferPool* bp, Acqs&... acqs)
+{
+  (bp->release(&*acqs), ...);
+}
+#endif
+
 struct YCSBTransaction
 {
 public:
   static Index<YCSBRow>* index;
+#ifdef STORAGE_TIER
+  static BufferPool* buffer_pool;
+#endif
 
   static int prepare_cowns(char* input)
   {
@@ -140,6 +166,20 @@ public:
        AcqType acq_row7,
        AcqType acq_row8,
        AcqType acq_row9) {
+#ifdef STORAGE_TIER
+        buffer_pool_acquire_all(
+          YCSBTransaction::buffer_pool,
+          acq_row0,
+          acq_row1,
+          acq_row2,
+          acq_row3,
+          acq_row4,
+          acq_row5,
+          acq_row6,
+          acq_row7,
+          acq_row8,
+          acq_row9);
+#endif
         uint8_t sum = 0;
         uint16_t write_set_l = ws_cap;
         int j;
@@ -153,6 +193,20 @@ public:
         TXN(7);
         TXN(8);
         TXN(9);
+#ifdef STORAGE_TIER
+        buffer_pool_release_all(
+          YCSBTransaction::buffer_pool,
+          acq_row0,
+          acq_row1,
+          acq_row2,
+          acq_row3,
+          acq_row4,
+          acq_row5,
+          acq_row6,
+          acq_row7,
+          acq_row8,
+          acq_row9);
+#endif
         M_LOG_LATENCY();
       };
     return sizeof(YCSBTransactionMarshalled);
@@ -162,6 +216,9 @@ public:
 };
 
 Index<YCSBRow>* YCSBTransaction::index;
+#ifdef STORAGE_TIER
+BufferPool* YCSBTransaction::buffer_pool;
+#endif
 
 int main(int argc, char** argv)
 {
@@ -184,17 +241,19 @@ int main(int argc, char** argv)
   uint8_t* cown_arr_addr =
     static_cast<uint8_t*>(aligned_alloc_hpage(COWN_STRIDE * DB_SIZE));
 #ifdef STORAGE_TIER
-  uint8_t* payload_arr_addr =
-    static_cast<uint8_t*>(aligned_alloc_hpage_lazy((uint64_t)ROW_SIZE * DB_SIZE));
+  // Creates backing file for payload and initialises buffer pool
+  int backing_fd =
+    create_backing_file(BACKING_FILE_PATH, (uint64_t)ROW_SIZE * DB_SIZE);
+  size_t n_slots = (uint64_t)DB_SIZE * BACKING_FILE_BUDGET_PCT / 100;
+  YCSBTransaction::buffer_pool = new BufferPool(n_slots, core_cnt, backing_fd);
 #endif
 
   for (int i = 0; i < DB_SIZE; i++)
   {
 #ifdef STORAGE_TIER
-    char* payload_ptr =
-      reinterpret_cast<char*>(payload_arr_addr + (uint64_t)ROW_SIZE * i);
     cown_ptr<YCSBRow> cown_r = make_cown_custom<YCSBRow>(
-      reinterpret_cast<void*>(cown_arr_addr + COWN_STRIDE * i), payload_ptr);
+      reinterpret_cast<void*>(cown_arr_addr + COWN_STRIDE * i),
+      static_cast<uint32_t>(i));
 #else
     cown_ptr<YCSBRow> cown_r = make_cown_custom<YCSBRow>(
       reinterpret_cast<void*>(cown_arr_addr + COWN_STRIDE * i));

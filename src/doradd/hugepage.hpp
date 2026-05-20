@@ -1,3 +1,5 @@
+#pragma once
+
 // Source:
 // https://mazzo.li/posts/check-huge-page.html
 
@@ -146,17 +148,15 @@ void* aligned_alloc_hpage(size_t sz)
   return buf_begin;
 }
 
-void* aligned_alloc_hpage_lazy(size_t sz)
+// Creates backing file of specified size at given path, returning file descriptor
+int create_backing_file(const char* path, size_t sz)
 {
-  size_t hpage_nr = (size_t)(sz / HPAGE_SIZE) + 1;
-  size_t alloc_sz = hpage_nr * HPAGE_SIZE;
-
-  void* buf = aligned_alloc(HPAGE_SIZE, alloc_sz);
-  if (!buf)
-    printf("could not allocate mem: %s\n", strerror(errno));
-
-  madvise(buf, alloc_sz, MADV_HUGEPAGE);
-
-  printf("allocated huge pages (lazy)\n");
-  return buf;
+  int fd = open(path, O_RDWR | O_CREAT, 0644);
+  if (fd < 0)
+    localFail("could not open %s: %s\n", path, strerror(errno));
+  unlink(path); // File is deleted when file descriptor is closed
+  if (ftruncate(fd, static_cast<off_t>(sz)) != 0)
+    localFail("ftruncate %s: %s\n", path, strerror(errno));
+  printf("created backing file at %s (%zu MB)\n", path, sz >> 20);
+  return fd;
 }
