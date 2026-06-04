@@ -13,6 +13,10 @@ std::unordered_map<std::thread::id, uint64_t*>* counter_map;
 std::unordered_map<std::thread::id, log_arr_type*>* log_map;
 std::mutex* counter_map_mutex;
 
+// Runs code at the end of the pipeline (used for printing buffer pool stats)
+template<typename T>
+inline void pipeline_teardown() {}
+
 template<typename T>
 void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
 {
@@ -121,12 +125,12 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
 #  endif // INDEXER
 
     std::thread spawner_thread([&]() mutable {
-      pin_thread(1);
+      pin_thread(2);
       std::this_thread::sleep_for(std::chrono::seconds(1));
       spawner.run();
     });
     std::thread prefetcher_thread([&]() mutable {
-      pin_thread(2);
+      pin_thread(4);
       std::this_thread::sleep_for(std::chrono::seconds(2));
       prefetcher.run();
     });
@@ -134,7 +138,7 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
 
 #ifdef INDEXER
     std::thread indexer_thread([&]() mutable {
-      pin_thread(3);
+      pin_thread(6);
       std::this_thread::sleep_for(std::chrono::seconds(4));
       indexer.run();
     });
@@ -180,6 +184,7 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
       }
     }
 #endif
+    pipeline_teardown<T>();
 
     // sched.remove_external_event_source();
   };

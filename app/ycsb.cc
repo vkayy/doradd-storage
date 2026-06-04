@@ -7,6 +7,13 @@
 #endif
 
 #include <thread>
+#ifdef STORAGE_TIER
+#include <algorithm>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #define GET_COWN(_INDEX) \
   auto&& row##_INDEX = get_cown_ptr_from_addr<YCSBRow>( \
@@ -51,7 +58,8 @@
 static constexpr size_t COWN_STRIDE = 64;
 static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
 static const char* BACKING_FILE_PATH = "/tmp/ycsb_doradd_payload.bin";
-static constexpr size_t BACKING_FILE_BUDGET_PCT = 80;
+static constexpr size_t BACKING_FILE_BUDGET_PCT = 40;
+static constexpr size_t WARMUP_PASSES = 4;
 #else
 struct YCSBRow
 {
@@ -78,7 +86,11 @@ inline void buffer_pool_acquire_all(BufferPool* bp, Acqs&... acqs)
 template<typename... Acqs>
 inline void buffer_pool_release_all(BufferPool* bp, Acqs&... acqs)
 {
+#ifdef LRU_EVICT
+  bp->release_batch(&*acqs...);
+#else
   (bp->release(&*acqs), ...);
+#endif
 }
 #endif
 
@@ -220,6 +232,69 @@ Index<YCSBRow>* YCSBTransaction::index;
 BufferPool* YCSBTransaction::buffer_pool;
 #endif
 
+#ifdef STORAGE_TIER
+static void warmup_buffer_pool(const char* log_name, size_t n_slots)
+{
+  int fd = open(log_name, O_RDONLY);
+  if (fd == -1)
+  {
+    fprintf(
+      stderr, "warmup: cannot open log %s: %s\n", log_name, strerror(errno));
+    return;
+  }
+  struct stat sb;
+  fstat(fd, &sb);
+  void* base = mmap(
+    nullptr, sb.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+  if (base == MAP_FAILED)
+  {
+    fprintf(stderr, "warmup: mmap failed: %s\n", strerror(errno));
+    close(fd);
+    return;
+  }
+
+  uint32_t count = *reinterpret_cast<const uint32_t*>(base);
+  auto* txns = reinterpret_cast<const YCSBTransactionMarshalled*>(
+    static_cast<const char*>(base) + sizeof(uint32_t));
+  size_t n_txns = count;
+  size_t cap = std::min(n_txns, WARMUP_PASSES * n_slots / ROWS_PER_TX);
+  auto* bp = YCSBTransaction::buffer_pool;
+  auto* index = YCSBTransaction::index;
+
+  for (size_t t = 0; t < cap; t++)
+  {
+    YCSBRow* rows[ROWS_PER_TX];
+    for (uint32_t i = 0; i < ROWS_PER_TX; i++)
+    {
+      uint32_t key = txns[t].indices[i];
+      rows[i] = index->get_row_addr(key)->get_ref_unsafe();
+      bp->acquire(rows[i]);
+    }
+#ifdef LRU_EVICT
+    bp->release_batch(
+      rows[0], rows[1], rows[2], rows[3], rows[4],
+      rows[5], rows[6], rows[7], rows[8], rows[9]);
+#else
+    for (uint32_t i = 0; i < ROWS_PER_TX; i++)
+      bp->release(rows[i]);
+#endif
+  }
+
+  munmap(base, sb.st_size);
+  close(fd);
+  bp->reset_stats();
+  fprintf(stderr, "warmup complete: touched %zu txns\n", cap);
+}
+#endif
+
+template<>
+inline void pipeline_teardown<YCSBTransaction>()
+{
+#ifdef STORAGE_TIER
+  YCSBTransaction::buffer_pool->print_stats();
+#endif
+}
+
 int main(int argc, char** argv)
 {
   if (argc != 6 || strcmp(argv[1], "-n") != 0)
@@ -243,7 +318,7 @@ int main(int argc, char** argv)
 #ifdef STORAGE_TIER
   // Creates backing file for payload and initialises buffer pool
   int backing_fd =
-    create_backing_file(BACKING_FILE_PATH, (uint64_t)ROW_SIZE * DB_SIZE);
+    create_backing_file(BACKING_FILE_PATH, (uint64_t)DISK_ROW_SIZE * DB_SIZE);
   size_t n_slots = (uint64_t)DB_SIZE * BACKING_FILE_BUDGET_PCT / 100;
   YCSBTransaction::buffer_pool = new BufferPool(n_slots, core_cnt, backing_fd);
 #endif
@@ -265,6 +340,10 @@ int main(int argc, char** argv)
 
     YCSBTransaction::index->insert_row(cown_r);
   }
+
+#ifdef STORAGE_TIER
+  warmup_buffer_pool(argv[3], n_slots);
+#endif
 
   build_pipelines<YCSBTransaction>(core_cnt - 1, argv[3], argv[5]);
 }

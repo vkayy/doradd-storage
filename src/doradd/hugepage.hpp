@@ -151,6 +151,36 @@ void* aligned_alloc_hpage(size_t sz)
 // Creates backing file of specified size at given path, returning file descriptor
 int create_backing_file(const char* path, size_t sz)
 {
+#ifdef DIRECT_IO
+  // Materialise every block first so misses actually reach  disk
+  {
+    int pfd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (pfd < 0)
+      localFail("could not open %s to fill: %s\n", path, strerror(errno));
+    const size_t fill_buf = (size_t)4 << 20;
+    char* buf = static_cast<char*>(malloc(fill_buf));
+    memset(buf, 0xAB, fill_buf);
+    size_t off = 0;
+    while (off < sz)
+    {
+      size_t chunk = (sz - off < fill_buf) ? (sz - off) : fill_buf;
+      if (write(pfd, buf, chunk) != static_cast<ssize_t>(chunk))
+        localFail("backing-file fill failed at %zu: %s\n", off, strerror(errno));
+      off += chunk;
+    }
+    free(buf);
+    if (fsync(pfd) != 0)
+      localFail("fsync %s: %s\n", path, strerror(errno));
+    posix_fadvise(pfd, 0, (off_t)sz, POSIX_FADV_DONTNEED);
+    close(pfd);
+  }
+  int fd = open(path, O_RDWR | O_DIRECT, 0644);
+  if (fd < 0)
+    localFail("could not open %s (O_DIRECT): %s\n", path, strerror(errno));
+  unlink(path); // File is deleted when file descriptor is closed
+  printf("created+filled backing file at %s (%zu MB)\n", path, sz >> 20);
+  return fd;
+#else
   int fd = open(path, O_RDWR | O_CREAT, 0644);
   if (fd < 0)
     localFail("could not open %s: %s\n", path, strerror(errno));
@@ -159,4 +189,5 @@ int create_backing_file(const char* path, size_t sz)
     localFail("ftruncate %s: %s\n", path, strerror(errno));
   printf("created backing file at %s (%zu MB)\n", path, sz >> 20);
   return fd;
+#endif
 }
