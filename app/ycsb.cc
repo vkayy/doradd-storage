@@ -295,6 +295,22 @@ inline void pipeline_teardown<YCSBTransaction>()
 #endif
 }
 
+template<>
+inline void pipeline_stats<YCSBTransaction>()
+{
+#ifdef STORAGE_TIER
+  static BufferPool::Stats prev{};
+  BufferPool::Stats cur = YCSBTransaction::buffer_pool->snapshot();
+  printf(
+    "window fetches=%llu evictions=%llu writebacks=%llu resident=%llu\n",
+    static_cast<unsigned long long>(cur.fetches - prev.fetches),
+    static_cast<unsigned long long>(cur.evictions - prev.evictions),
+    static_cast<unsigned long long>(cur.writebacks - prev.writebacks),
+    static_cast<unsigned long long>(cur.resident));
+  prev = cur;
+#endif
+}
+
 int main(int argc, char** argv)
 {
   if (argc != 6 || strcmp(argv[1], "-n") != 0)

@@ -52,7 +52,8 @@ public:
     n_resident_(0),
     n_acquires_(0),
     n_fetches_(0),
-    n_evicts_(0)
+    n_evicts_(0),
+    n_writebacks_(0)
     #ifdef LRU_EVICT
         , clock_(1)
     #endif
@@ -135,6 +136,26 @@ public:
     fflush(stdout);
   }
 
+  struct Stats
+  {
+    uint64_t acquires;
+    uint64_t fetches;
+    uint64_t evictions;
+    uint64_t writebacks;
+    uint64_t resident;
+  };
+
+  // Snapshot of cumulative counters for per-window deltas
+  Stats snapshot() const
+  {
+    return Stats{
+      n_acquires_.load(std::memory_order_relaxed),
+      n_fetches_.load(std::memory_order_relaxed),
+      n_evicts_.load(std::memory_order_relaxed),
+      n_writebacks_.load(std::memory_order_relaxed),
+      n_resident_.load(std::memory_order_relaxed)};
+  }
+
 private:
   // Reads a row's payload from the backing file into the given slot, returning slot address
   char* read_into_slot(YCSBRow* row, size_t slot_idx)
@@ -183,6 +204,7 @@ private:
         abort();
       }
       row->is_dirty = 0;
+      n_writebacks_.fetch_add(1, std::memory_order_relaxed);
     }
     row->payload = nullptr;
     n_resident_.fetch_sub(1, std::memory_order_relaxed);
@@ -254,6 +276,7 @@ private:
   std::atomic<uint64_t> n_acquires_;
   std::atomic<uint64_t> n_fetches_;
   std::atomic<uint64_t> n_evicts_;
+  std::atomic<uint64_t> n_writebacks_;
   #ifdef LRU_EVICT
     std::atomic<uint64_t> clock_;
   #endif

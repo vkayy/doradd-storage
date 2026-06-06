@@ -1,6 +1,11 @@
 #pragma once
 
 #include "config.hpp"
+
+// Per-window stats hook; declared ahead of dispatcher.hpp so spawner sees it
+template<typename T>
+inline void pipeline_stats() {}
+
 #include "dispatcher.hpp"
 #include "pin-thread.hpp"
 #include "rpc_handler.hpp"
@@ -151,7 +156,7 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
     });
 
     // flush latency logs
-    std::this_thread::sleep_for(std::chrono::seconds(20));
+    std::this_thread::sleep_for(std::chrono::seconds(70));
 #ifdef CORE_PIPE
     pthread_cancel(spawner_thread.native_handle());
     pthread_cancel(prefetcher_thread.native_handle());
@@ -170,6 +175,7 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
     {
       if (entry.second)
       {
+        fprintf(res_log_fd, "# worker\n");
 #  ifdef LOG_SCHED_OHEAD
         for (std::tuple<uint32_t, uint32_t> value_tuple : *(entry.second))
           fprintf(
