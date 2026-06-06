@@ -156,7 +156,35 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
     });
 
     // flush latency logs
-    std::this_thread::sleep_for(std::chrono::seconds(70));
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+
+    // Workaround to only run teardown when every spawned behaviour has committed (to reproduce checksum)
+    {
+      uint64_t done = 0, prev = 0, stall = 0;
+      while (done < RPC_LOG_SIZE)
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        done = 0;
+        {
+          std::lock_guard<std::mutex> lock(*counter_map_mutex);
+          for (const auto& e : *counter_map)
+            done += *(e.second);
+        }
+        stall = (done == prev) ? stall + 1 : 0;
+        prev = done;
+        if (stall > 600) // Break after 30 seconds with no progress
+        {
+          // Any run printing this is INVALID (teardown could race workers)
+          fprintf(
+            stderr,
+            "STALL (run INVALID): %lu/%lu committed\n",
+            done,
+            static_cast<unsigned long>(RPC_LOG_SIZE));
+          break;
+        }
+      }
+    }
+
 #ifdef CORE_PIPE
     pthread_cancel(spawner_thread.native_handle());
     pthread_cancel(prefetcher_thread.native_handle());

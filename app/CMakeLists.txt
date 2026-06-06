@@ -47,6 +47,12 @@ target_compile_definitions(ycsb PRIVATE -DACQUIRE_ALL)
 target_link_libraries(ycsb PRIVATE ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(ycsb PRIVATE atomic)
 target_include_directories(ycsb PRIVATE ../external/SPSCQueue/include/rigtorp)
+if(CMAKE_CXX_FLAGS MATCHES "ASYNC_PREFETCH")
+  target_link_libraries(ycsb PRIVATE uring)
+endif()
+if(CMAKE_CXX_FLAGS MATCHES "ASYNC_YIELD")
+  target_link_libraries(ycsb PRIVATE uring)
+endif()
 
 add_custom_command(
   OUTPUT ${CMAKE_SOURCE_DIR}/tpcc_gen.cc
