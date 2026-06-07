@@ -12,5 +12,9 @@ static constexpr uint32_t DISK_ROW_SIZE = (ROW_SIZE + 511) / 512 * 512;
 static constexpr uint32_t DISK_ROW_SIZE = ROW_SIZE;
 #endif
 static const uint64_t DB_SIZE = 10'000'000;
+#ifdef SIM_STORAGE
+// Simulated device latency (symmetric read/write delay)
+static constexpr uint64_t SIM_DELAY_NS = 100000;
+#endif
 // const uint64_t PENDING_THRESHOLD = 100'000;
 // const uint64_t SPAWN_THRESHOLD = 100'000;

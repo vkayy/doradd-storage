@@ -156,7 +156,7 @@ void build_pipelines(int worker_cnt, char* log_name, char* gen_type)
     });
 
     // flush latency logs
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::this_thread::sleep_for(std::chrono::seconds(66));
 
     // Workaround to only run teardown when every spawned behaviour has committed (to reproduce checksum)
     {

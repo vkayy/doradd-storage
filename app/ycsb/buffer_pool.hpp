@@ -2,6 +2,9 @@
 
 #include "constants.hpp"
 #include "hugepage.hpp"
+#ifdef SIM_STORAGE
+#include "sim_storage.hpp"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +18,7 @@
 #include <unistd.h>
 #include <vector>
 
-#ifdef ASYNC_YIELD
+#if defined(ASYNC_YIELD) && !defined(SIM_STORAGE)
 // Slots are DISK_ROW_SIZE-strided off a hugepage base; 512-alignment for O_DIRECT
 static_assert(DISK_ROW_SIZE % 512 == 0,
   "ASYNC_YIELD requires DISK_ROW_SIZE 512-aligned (build with DIRECT_IO)");
@@ -181,6 +184,9 @@ public:
   {
     if (row->payload == nullptr || !row->is_dirty)
       return;
+#ifdef SIM_STORAGE
+    memcpy(sim_storage->row(row->row_idx), row->payload, DISK_ROW_SIZE);
+#else
     off_t payload_off = static_cast<off_t>(row->row_idx) * DISK_ROW_SIZE;
     if (
       pwrite(fd_, row->payload, DISK_ROW_SIZE, payload_off) !=
@@ -189,13 +195,16 @@ public:
       fprintf(stderr, "flush: failed to write row %u: %s\n", row->row_idx, strerror(errno));
       abort();
     }
+#endif
     row->is_dirty = 0;
   }
 
   // Sync backing file after final writebacks (teardown)
   void fsync_backing()
   {
+#ifndef SIM_STORAGE
     fsync(fd_);
+#endif
   }
 
 #ifdef ASYNC_YIELD
@@ -218,7 +227,7 @@ public:
     n_fetches_.fetch_add(1, std::memory_order_relaxed);
   }
 
-  // Admission: only allow fetch if we won't exceed max in-flight transactions (queue-depth knob)
+  // Onlt allow fetch if we won't exceed max in-flight transactions
   bool try_admit()
   {
     size_t cur = inflight_.load(std::memory_order_relaxed);
@@ -262,6 +271,14 @@ private:
   char* read_into_slot(YCSBRow* row, size_t slot_idx)
   {
     char* slot_addr = reinterpret_cast<char*>(pool_ + slot_idx * DISK_ROW_SIZE);
+#ifdef SIM_STORAGE
+    if (!sim_storage->warming)
+      sim_spin_until(
+        std::chrono::steady_clock::now() +
+        std::chrono::nanoseconds(SIM_DELAY_NS));
+    memcpy(slot_addr, sim_storage->row(row->row_idx), DISK_ROW_SIZE);
+    return slot_addr;
+#else
     off_t payload_off = static_cast<off_t>(row->row_idx) * DISK_ROW_SIZE;
     ssize_t ret = pread(fd_, slot_addr, DISK_ROW_SIZE, payload_off);
     if (ret != static_cast<ssize_t>(DISK_ROW_SIZE))
@@ -279,6 +296,7 @@ private:
       abort();
     }
     return slot_addr;
+#endif
   }
 
   // Finds free slot in memory, reads payload from backing file into it, and updates row's payload pointer
@@ -296,6 +314,14 @@ private:
     size_t slot_idx = (reinterpret_cast<uint8_t*>(row->payload) - pool_) / DISK_ROW_SIZE;
     if (row->is_dirty)
     {
+#ifdef SIM_STORAGE
+      // Symmetric write delay: a writeback IO costs delta like a fetch does
+      if (!sim_storage->warming)
+        sim_spin_until(
+          std::chrono::steady_clock::now() +
+          std::chrono::nanoseconds(SIM_DELAY_NS));
+      memcpy(sim_storage->row(row->row_idx), row->payload, DISK_ROW_SIZE);
+#else
       off_t payload_off = static_cast<off_t>(row->row_idx) * DISK_ROW_SIZE;
       if (
         pwrite(fd_, row->payload, DISK_ROW_SIZE, payload_off) !=
@@ -304,6 +330,7 @@ private:
         fprintf(stderr, "failed to write row %u: %s\n", row->row_idx, strerror(errno));
         abort();
       }
+#endif
       row->is_dirty = 0;
       n_writebacks_.fetch_add(1, std::memory_order_relaxed);
     }

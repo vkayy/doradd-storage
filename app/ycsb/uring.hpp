@@ -9,9 +9,14 @@
 #  include <cstdio>
 #  include <cstdlib>
 #  include <cstring>
-#  include <liburing.h>
 #  include <mutex>
-#  include <sys/stat.h>
+#  ifdef SIM_STORAGE
+#    include <chrono>
+#  endif
+#  if !defined(SIM_STORAGE) || defined(SIM_RING)
+#    include <liburing.h>
+#    include <sys/stat.h>
+#  endif
 
 // Per-transaction async state
 struct TxState
@@ -27,14 +32,21 @@ struct TxState
   std::atomic<uint8_t> n_done{0};
   uint8_t miss_i[ROWS_PER_TX];
   size_t slot[ROWS_PER_TX];
+#  ifdef SIM_STORAGE
+  // Submit time of miss batch, so completion waits for delta to elapse after submit_ts
+  std::chrono::steady_clock::time_point submit_ts;
+#  endif
 
   TxState() = default;
-  
+
   // Moved once at schedule time (no IO in flight)
   TxState(TxState&& o) noexcept
   : phase(o.phase),
     n_miss(o.n_miss),
     n_done(o.n_done.load(std::memory_order_relaxed))
+#  ifdef SIM_STORAGE
+    , submit_ts(o.submit_ts)
+#  endif
   {
     for (uint32_t i = 0; i < ROWS_PER_TX; i++)
     {
@@ -44,14 +56,14 @@ struct TxState
   }
 };
 
-// One global ring, one mutex guarding both submit and reap (v0: deliberately simple)
+#  if !defined(SIM_STORAGE) || defined(SIM_RING)
+// One global ring, one mutex guarding both submit and reap
 struct Uring
 {
   io_uring ring;
   std::mutex mu;
   int fd;
 
-  // Initialise io_uring with given backing file and queue depth
   void init(int backing_fd, unsigned entries)
   {
     fd = backing_fd;
@@ -113,5 +125,6 @@ struct Uring
 };
 
 extern Uring* uring;
+#  endif // !SIM_STORAGE || SIM_RING
 
 #endif // ASYNC_YIELD
