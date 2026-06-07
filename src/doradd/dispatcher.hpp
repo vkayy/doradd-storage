@@ -242,6 +242,7 @@ public:
         printf("spawn - %lf tx/s\n", tx_count / dur_cnt);
         printf(
           "exec  - %lf tx/s\n", (tx_exec_sum - last_tx_exec_sum) / dur_cnt);
+        pipeline_stats<T>();
         tx_count = 0;
         last_tx_exec_sum = tx_exec_sum;
         last_print = time_now;
@@ -570,6 +571,7 @@ struct Spawner
         printf("spawn - %lf tx/s\n", tx_count / dur_cnt);
         printf(
           "exec  - %lf tx/s\n", (tx_exec_sum - last_tx_exec_sum) / dur_cnt);
+        pipeline_stats<T>();
 #ifdef RPC_LATENCY
         fprintf(res_log_fd, "%lf\n", tx_count / dur_cnt);
 #endif
