@@ -95,6 +95,37 @@ struct Uring
     }
   }
 
+#  ifdef BATCH_SUBMIT
+  struct ReadReq
+  {
+    void* buf;
+    off_t off;
+  };
+
+  // Prep all of a txn's reads then ONE submit, mutex held once per batch
+  void submit_reads(const ReadReq* reqs, int n, size_t len, void* user_data)
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    for (int i = 0; i < n; i++)
+    {
+      io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+      if (!sqe)
+      {
+        fprintf(stderr, "io_uring_get_sqe: submission queue full\n");
+        abort();
+      }
+      io_uring_prep_read(sqe, fd, reqs[i].buf, len, reqs[i].off);
+      io_uring_sqe_set_data(sqe, user_data);
+    }
+    int ret = io_uring_submit(&ring);
+    if (ret < 0)
+    {
+      fprintf(stderr, "io_uring_submit failed: %s\n", strerror(-ret));
+      abort();
+    }
+  }
+#  endif
+
   // Polls for completions, updating state of transactions with completed reads
   void poll()
   {
