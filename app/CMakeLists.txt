@@ -50,7 +50,7 @@ target_include_directories(ycsb PRIVATE ../external/SPSCQueue/include/rigtorp)
 if(CMAKE_CXX_FLAGS MATCHES "ASYNC_PREFETCH")
   target_link_libraries(ycsb PRIVATE uring)
 endif()
-if(CMAKE_CXX_FLAGS MATCHES "ASYNC_YIELD")
+if(CMAKE_CXX_FLAGS MATCHES "ASYNC_YIELD" AND (NOT CMAKE_CXX_FLAGS MATCHES "SIM_STORAGE" OR CMAKE_CXX_FLAGS MATCHES "SIM_RING"))
   target_link_libraries(ycsb PRIVATE uring)
 endif()
 

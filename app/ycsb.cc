@@ -5,6 +5,9 @@
 #ifdef STORAGE_TIER
 #include "ycsb/buffer_pool.hpp"
 #endif
+#ifdef SIM_STORAGE
+#include "ycsb/sim_storage.hpp"
+#endif
 #ifdef ASYNC_YIELD
 #include "ycsb/uring.hpp"
 #include <sched/behaviour.h>
@@ -60,6 +63,7 @@
 #endif
 
 #ifdef ASYNC_YIELD
+// Set rerun flag and return: runtime reschedules same work, keeps cowns held
 #  define YIELD() \
     do \
     { \
@@ -72,7 +76,7 @@
 static constexpr size_t COWN_STRIDE = 64;
 static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
 static const char* BACKING_FILE_PATH = "/tmp/ycsb_doradd_payload.bin";
-static constexpr size_t BACKING_FILE_BUDGET_PCT = 70;
+static constexpr size_t BACKING_FILE_BUDGET_PCT = 40;
 static constexpr size_t WARMUP_PASSES = 4;
 #else
 struct YCSBRow
@@ -106,6 +110,11 @@ inline void buffer_pool_release_all(BufferPool* bp, Acqs&... acqs)
   (bp->release(&*acqs), ...);
 #endif
 }
+#endif
+
+#ifdef ASYNC_YIELD
+// Counts behaviour invocations to observe yield frequency
+std::atomic<uint64_t> pass_count{0};
 #endif
 
 struct YCSBTransaction
@@ -209,8 +218,12 @@ public:
           &*acq_row5, &*acq_row6, &*acq_row7, &*acq_row8, &*acq_row9};
         auto* bp = YCSBTransaction::buffer_pool;
 
+        pass_count.fetch_add(1, std::memory_order_relaxed); // One per invoke
+
+#if !defined(SIM_STORAGE) || defined(SIM_RING)
         // Drain completions before checking misses to ensure accurate state
         uring->poll();
+#endif
 
         if (st.phase == TxState::INIT)
         {
@@ -226,12 +239,22 @@ public:
               YIELD(); // Too many in-flight transactions
             for (int i = 0; i < st.n_miss; i++)
               st.slot[i] = bp->reserve_slot();
+#ifdef SIM_STORAGE
+            // No ring overhead, completion waits on delta elapsed after submit_ts
+            st.submit_ts = std::chrono::steady_clock::now();
+#  ifdef SIM_RING
+            // Variant to observe cost of ring overhead 
+            for (int i = 0; i < st.n_miss; i++)
+              uring->submit_read(bp->slot_addr(st.slot[i]), DISK_ROW_SIZE, 0, &st);
+#  endif
+#else
             for (int i = 0; i < st.n_miss; i++)
               uring->submit_read(
                 bp->slot_addr(st.slot[i]),
                 DISK_ROW_SIZE,
                 static_cast<off_t>(rows[st.miss_i[i]]->row_idx) * DISK_ROW_SIZE,
                 &st);
+#endif
             st.phase = TxState::WAIT;
             YIELD(); // Wait for reads to complete
           }
@@ -240,6 +263,26 @@ public:
 
         if (st.phase == TxState::WAIT)
         {
+#ifdef SIM_STORAGE
+#  ifdef SIM_RING
+          if (st.n_done.load(std::memory_order_acquire) != st.n_miss)
+            YIELD();
+#  endif
+          if (
+            st.n_miss > 0 &&
+            std::chrono::steady_clock::now() - st.submit_ts <
+              std::chrono::nanoseconds(SIM_DELAY_NS))
+            YIELD(); // Delta not yet elapsed
+          for (int i = 0; i < st.n_miss; i++)
+          {
+            memcpy(
+              bp->slot_addr(st.slot[i]),
+              sim_storage->row(rows[st.miss_i[i]]->row_idx),
+              DISK_ROW_SIZE);
+            bp->install(rows[st.miss_i[i]], st.slot[i]);
+            assert(rows[st.miss_i[i]]->payload != nullptr);
+          }
+#else
           if (st.n_done.load(std::memory_order_acquire) != st.n_miss)
             YIELD(); // Still waiting on reads to complete
           for (int i = 0; i < st.n_miss; i++)
@@ -247,6 +290,7 @@ public:
             bp->install(rows[st.miss_i[i]], st.slot[i]);
             assert(rows[st.miss_i[i]]->payload != nullptr);
           }
+#endif
           if (st.n_miss > 0)
             bp->release_admit();
           st.phase = TxState::DONE;
@@ -307,8 +351,11 @@ Index<YCSBRow>* YCSBTransaction::index;
 #ifdef STORAGE_TIER
 BufferPool* YCSBTransaction::buffer_pool;
 #endif
-#ifdef ASYNC_YIELD
+#if defined(ASYNC_YIELD) && (!defined(SIM_STORAGE) || defined(SIM_RING))
 Uring* uring;
+#endif
+#ifdef SIM_STORAGE
+SimStorage* sim_storage;
 #endif
 
 #ifdef STORAGE_TIER
@@ -340,6 +387,9 @@ static void warmup_buffer_pool(const char* log_name, size_t n_slots)
   auto* bp = YCSBTransaction::buffer_pool;
   auto* index = YCSBTransaction::index;
 
+#ifdef SIM_STORAGE
+  sim_storage->warming = true; // Skip delta during warmup to avoid long waits on large delta
+#endif
   for (size_t t = 0; t < cap; t++)
   {
     YCSBRow* rows[ROWS_PER_TX];
@@ -361,6 +411,9 @@ static void warmup_buffer_pool(const char* log_name, size_t n_slots)
 
   munmap(base, sb.st_size);
   close(fd);
+#ifdef SIM_STORAGE
+  sim_storage->warming = false;
+#endif
   bp->reset_stats();
   fprintf(stderr, "warmup complete: touched %zu txns\n", cap);
 }
@@ -378,6 +431,15 @@ inline void pipeline_teardown<YCSBTransaction>()
   bp->print_stats();
 #ifdef ASYNC_YIELD
   bp->slot_check();
+  printf(
+    "passes: total=%llu per_tx=%.3f\n",
+    static_cast<unsigned long long>(pass_count.load(std::memory_order_relaxed)),
+    static_cast<double>(pass_count.load(std::memory_order_relaxed)) / RPC_LOG_SIZE);
+  fflush(stdout);
+#endif
+#ifdef SIM_STORAGE
+  if (getenv("SIM_DUMP"))
+    sim_storage->dump("/tmp/ycsb_sim_payload.bin");
 #endif
 #endif
 }
@@ -419,15 +481,27 @@ int main(int argc, char** argv)
   uint8_t* cown_arr_addr =
     static_cast<uint8_t*>(aligned_alloc_hpage(COWN_STRIDE * DB_SIZE));
 #ifdef STORAGE_TIER
+  size_t n_slots = (uint64_t)DB_SIZE * BACKING_FILE_BUDGET_PCT / 100;
+#ifdef SIM_STORAGE
+  // Simulated tier has no backing file (has ring variant though)
+  sim_storage = new SimStorage();
+  sim_storage->init();
+  int backing_fd = -1;
+#else
   // Creates backing file for payload and initialises buffer pool
   int backing_fd =
     create_backing_file(BACKING_FILE_PATH, (uint64_t)DISK_ROW_SIZE * DB_SIZE);
-  size_t n_slots = (uint64_t)DB_SIZE * BACKING_FILE_BUDGET_PCT / 100;
+#endif
   YCSBTransaction::buffer_pool = new BufferPool(n_slots, core_cnt, backing_fd);
 #endif
-#ifdef ASYNC_YIELD
+#if defined(ASYNC_YIELD) && !defined(SIM_STORAGE)
   uring = new Uring();
   uring->init(backing_fd, BufferPool::MAX_INFLIGHT_TX * ROWS_PER_TX);
+#endif
+#ifdef SIM_RING
+  // Simulated storage ring just reads a cached scratch file, takes on ring overhead
+  uring = new Uring();
+  uring->init(sim_ring_scratch_fd(), BufferPool::MAX_INFLIGHT_TX * ROWS_PER_TX);
 #endif
 
   for (int i = 0; i < DB_SIZE; i++)
