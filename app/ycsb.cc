@@ -5,6 +5,11 @@
 #ifdef STORAGE_TIER
 #include "ycsb/buffer_pool.hpp"
 #endif
+#ifdef ASYNC_YIELD
+#include "ycsb/uring.hpp"
+#include <sched/behaviour.h>
+#include <cassert>
+#endif
 
 #include <thread>
 #ifdef STORAGE_TIER
@@ -54,11 +59,20 @@
     }
 #endif
 
+#ifdef ASYNC_YIELD
+#  define YIELD() \
+    do \
+    { \
+      verona::rt::Behaviour::behaviour_rerun() = true; \
+      return; \
+    } while (0)
+#endif
+
 #ifdef STORAGE_TIER
 static constexpr size_t COWN_STRIDE = 64;
 static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
 static const char* BACKING_FILE_PATH = "/tmp/ycsb_doradd_payload.bin";
-static constexpr size_t BACKING_FILE_BUDGET_PCT = 40;
+static constexpr size_t BACKING_FILE_BUDGET_PCT = 70;
 static constexpr size_t WARMUP_PASSES = 4;
 #else
 struct YCSBRow
@@ -162,7 +176,14 @@ public:
 #endif
 
     using AcqType = acquired_cown<YCSBRow>;
-#ifdef RPC_LATENCY
+#if defined(ASYNC_YIELD) && defined(RPC_LATENCY)
+    when(row0, row1, row2, row3, row4, row5, row6, row7, row8, row9)
+      << [ws_cap, init_time, st = TxState{}]
+#elif defined(ASYNC_YIELD)
+    // Note that a patch in when.h (line 128) to support stateful lambdas is required for this
+    when(row0, row1, row2, row3, row4, row5, row6, row7, row8, row9)
+      << [ws_cap, st = TxState{}]
+#elif defined(RPC_LATENCY)
     when(row0, row1, row2, row3, row4, row5, row6, row7, row8, row9)
       << [ws_cap, init_time]
 #else
@@ -177,8 +198,63 @@ public:
        AcqType acq_row6,
        AcqType acq_row7,
        AcqType acq_row8,
-       AcqType acq_row9) {
-#ifdef STORAGE_TIER
+       AcqType acq_row9)
+#ifdef ASYNC_YIELD
+      mutable
+#endif
+      {
+#ifdef ASYNC_YIELD
+        YCSBRow* rows[ROWS_PER_TX] = {
+          &*acq_row0, &*acq_row1, &*acq_row2, &*acq_row3, &*acq_row4,
+          &*acq_row5, &*acq_row6, &*acq_row7, &*acq_row8, &*acq_row9};
+        auto* bp = YCSBTransaction::buffer_pool;
+
+        // Drain completions before checking misses to ensure accurate state
+        uring->poll();
+
+        if (st.phase == TxState::INIT)
+        {
+          st.n_miss = 0; // INIT may be entered multiple times
+          for (int i = 0; i < ROWS_PER_TX; i++)
+            if (rows[i]->payload == nullptr)
+              st.miss_i[st.n_miss++] = static_cast<uint8_t>(i);
+          assert(st.n_miss <= ROWS_PER_TX);
+
+          if (st.n_miss > 0)
+          {
+            if (!bp->try_admit())
+              YIELD(); // Too many in-flight transactions
+            for (int i = 0; i < st.n_miss; i++)
+              st.slot[i] = bp->reserve_slot();
+            for (int i = 0; i < st.n_miss; i++)
+              uring->submit_read(
+                bp->slot_addr(st.slot[i]),
+                DISK_ROW_SIZE,
+                static_cast<off_t>(rows[st.miss_i[i]]->row_idx) * DISK_ROW_SIZE,
+                &st);
+            st.phase = TxState::WAIT;
+            YIELD(); // Wait for reads to complete
+          }
+          st.phase = TxState::WAIT; // No misses, skip directly to WAIT phase
+        }
+
+        if (st.phase == TxState::WAIT)
+        {
+          if (st.n_done.load(std::memory_order_acquire) != st.n_miss)
+            YIELD(); // Still waiting on reads to complete
+          for (int i = 0; i < st.n_miss; i++)
+          {
+            bp->install(rows[st.miss_i[i]], st.slot[i]);
+            assert(rows[st.miss_i[i]]->payload != nullptr);
+          }
+          if (st.n_miss > 0)
+            bp->release_admit();
+          st.phase = TxState::DONE;
+        }
+
+        assert(st.phase == TxState::DONE);
+        bp->count_acquires(ROWS_PER_TX);
+#elif defined(STORAGE_TIER)
         buffer_pool_acquire_all(
           YCSBTransaction::buffer_pool,
           acq_row0,
@@ -230,6 +306,9 @@ public:
 Index<YCSBRow>* YCSBTransaction::index;
 #ifdef STORAGE_TIER
 BufferPool* YCSBTransaction::buffer_pool;
+#endif
+#ifdef ASYNC_YIELD
+Uring* uring;
 #endif
 
 #ifdef STORAGE_TIER
@@ -291,7 +370,15 @@ template<>
 inline void pipeline_teardown<YCSBTransaction>()
 {
 #ifdef STORAGE_TIER
-  YCSBTransaction::buffer_pool->print_stats();
+  auto* bp = YCSBTransaction::buffer_pool;
+  auto* index = YCSBTransaction::index;
+  for (uint64_t k = 0; k < DB_SIZE; k++)
+    bp->writeback_dirty(index->get_row_addr(k)->get_ref_unsafe());
+  bp->fsync_backing();
+  bp->print_stats();
+#ifdef ASYNC_YIELD
+  bp->slot_check();
+#endif
 #endif
 }
 
@@ -337,6 +424,10 @@ int main(int argc, char** argv)
     create_backing_file(BACKING_FILE_PATH, (uint64_t)DISK_ROW_SIZE * DB_SIZE);
   size_t n_slots = (uint64_t)DB_SIZE * BACKING_FILE_BUDGET_PCT / 100;
   YCSBTransaction::buffer_pool = new BufferPool(n_slots, core_cnt, backing_fd);
+#endif
+#ifdef ASYNC_YIELD
+  uring = new Uring();
+  uring->init(backing_fd, BufferPool::MAX_INFLIGHT_TX * ROWS_PER_TX);
 #endif
 
   for (int i = 0; i < DB_SIZE; i++)
