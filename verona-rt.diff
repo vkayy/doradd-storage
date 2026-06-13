@@ -1,0 +1,77 @@
+ src/rt/cpp/cown.h        |  8 ++++++++
+ src/rt/cpp/when.h        |  7 +++++++
+ src/rt/sched/behaviour.h | 13 +++++++++++++
+ 3 files changed, 28 insertions(+)
+===== FULL DIFF =====
+diff --git a/src/rt/cpp/cown.h b/src/rt/cpp/cown.h
+index bf83967..2425aaa 100644
+--- a/src/rt/cpp/cown.h
++++ b/src/rt/cpp/cown.h
+@@ -338,6 +338,14 @@ namespace verona::cpp
+       return reinterpret_cast<uint64_t>(allocated_cown);
+     }
+ 
++    // Resolves the underlying value without scheduling. Bypasses the `when`
++    // exclusivity guarantee, so only sound when the caller already holds the
++    // cown or no concurrent access is possible (e.g. before the scheduler runs).
++    T* get_ref_unsafe() const
++    {
++      return allocated_cown != nullptr ? &allocated_cown->value : nullptr;
++    }
++
+     ~cown_ptr()
+     {
+       clear();
+diff --git a/src/rt/cpp/when.h b/src/rt/cpp/when.h
+index 7e5d46c..91897ab 100644
+--- a/src/rt/cpp/when.h
++++ b/src/rt/cpp/when.h
+@@ -125,10 +125,17 @@ namespace verona::cpp
+           [f = std::forward<F>(f), cown_tuple = cown_tuple]() mutable {
+             /// Effectively converts ActualCown<T>... to
+             /// acquired_cown... .
++#ifdef ASYNC_YIELD
++            // By-ref so behaviour_rerun re-invokes the same f with the same state
++            auto lift_f = [&f](Access<Args>... args) mutable {
++              f(access_to_acquired<Args>(args)...);
++            };
++#else
+             auto lift_f = [f =
+                              std::forward<F>(f)](Access<Args>... args) mutable {
+               f(access_to_acquired<Args>(args)...);
+             };
++#endif
+ 
+             std::apply(lift_f, cown_tuple);
+           });
+diff --git a/src/rt/sched/behaviour.h b/src/rt/sched/behaviour.h
+index 15cfa00..98b18bb 100644
+--- a/src/rt/sched/behaviour.h
++++ b/src/rt/sched/behaviour.h
+@@ -20,6 +20,13 @@ namespace verona::rt
+       Be* body = behaviour->get_body<Be>();
+       (*body)();
+ 
++      if (behaviour_rerun())
++      {
++        behaviour_rerun() = false;
++        Scheduler::schedule(work);
++        return;
++      }
++
+       behaviour->release_all();
+ 
+       // Dealloc behaviour
+@@ -31,6 +38,12 @@ namespace verona::rt
+     }
+ 
+   public:
++    static bool& behaviour_rerun()
++    {
++      static thread_local bool rerun = false;
++      return rerun;
++    }
++
+     template<typename Be, typename... Args>
+     static Behaviour* make(size_t count, Args... args)
+     {

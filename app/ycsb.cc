@@ -13,6 +13,10 @@
 #include <sched/behaviour.h>
 #include <cassert>
 #endif
+#ifdef SPIN_YIELD
+#include <chrono>
+#include <immintrin.h>
+#endif
 
 #include <thread>
 #ifdef STORAGE_TIER
@@ -76,7 +80,7 @@
 static constexpr size_t COWN_STRIDE = 64;
 static_assert(sizeof(ActualCown<YCSBRow>) <= COWN_STRIDE);
 static const char* BACKING_FILE_PATH = "/tmp/ycsb_doradd_payload.bin";
-static constexpr size_t BACKING_FILE_BUDGET_PCT = 40;
+static constexpr size_t BACKING_FILE_BUDGET_PCT = 20;
 static constexpr size_t WARMUP_PASSES = 4;
 #else
 struct YCSBRow
@@ -115,6 +119,16 @@ inline void buffer_pool_release_all(BufferPool* bp, Acqs&... acqs)
 #ifdef ASYNC_YIELD
 // Counts behaviour invocations to observe yield frequency
 std::atomic<uint64_t> pass_count{0};
+#endif
+
+#ifdef SPIN_YIELD
+#  ifndef SPIN_BUDGET_NS
+#    define SPIN_BUDGET_NS 25000 // Large enough to cover I/O and ring overhead
+#  endif
+// Spin-poll instrumentation, relaxed like pass_count
+std::atomic<uint64_t> n_spin_loops{0};
+std::atomic<uint64_t> n_spin_timeouts{0};
+std::atomic<uint64_t> n_denials{0};
 #endif
 
 struct YCSBTransaction
@@ -236,7 +250,12 @@ public:
           if (st.n_miss > 0)
           {
             if (!bp->try_admit())
+            {
+#ifdef SPIN_YIELD
+              n_denials.fetch_add(1, std::memory_order_relaxed);
+#endif
               YIELD(); // Too many in-flight transactions
+            }
             for (int i = 0; i < st.n_miss; i++)
               st.slot[i] = bp->reserve_slot();
 #ifdef SIM_STORAGE
@@ -248,12 +267,21 @@ public:
               uring->submit_read(bp->slot_addr(st.slot[i]), DISK_ROW_SIZE, 0, &st);
 #  endif
 #else
+#  ifdef BATCH_SUBMIT
+            Uring::ReadReq reqs[ROWS_PER_TX];
+            for (int i = 0; i < st.n_miss; i++)
+              reqs[i] = {
+                bp->slot_addr(st.slot[i]),
+                static_cast<off_t>(rows[st.miss_i[i]]->row_idx) * DISK_ROW_SIZE};
+            uring->submit_reads(reqs, st.n_miss, DISK_ROW_SIZE, &st);
+#  else
             for (int i = 0; i < st.n_miss; i++)
               uring->submit_read(
                 bp->slot_addr(st.slot[i]),
                 DISK_ROW_SIZE,
                 static_cast<off_t>(rows[st.miss_i[i]]->row_idx) * DISK_ROW_SIZE,
                 &st);
+#  endif
 #endif
             st.phase = TxState::WAIT;
             YIELD(); // Wait for reads to complete
@@ -283,8 +311,36 @@ public:
             assert(rows[st.miss_i[i]]->payload != nullptr);
           }
 #else
+#  ifdef SPIN_YIELD
+          if (
+            st.n_miss > 0 &&
+            st.n_done.load(std::memory_order_acquire) != st.n_miss)
+          {
+            // Bounded spin-poll before yield, restores backpressure, keeps batch submit
+            auto spin_start = std::chrono::steady_clock::now();
+            uint64_t loops = 0;
+            for (;;)
+            {
+              uring->poll();
+              if (st.n_done.load(std::memory_order_acquire) == st.n_miss)
+                break;
+              _mm_pause();
+              if (
+                (++loops & 0x3f) == 0 &&
+                std::chrono::steady_clock::now() - spin_start >=
+                  std::chrono::nanoseconds(SPIN_BUDGET_NS))
+              {
+                n_spin_loops.fetch_add(loops, std::memory_order_relaxed);
+                n_spin_timeouts.fetch_add(1, std::memory_order_relaxed);
+                YIELD(); // Budget exhausted, tail-safety fallback
+              }
+            }
+            n_spin_loops.fetch_add(loops, std::memory_order_relaxed);
+          }
+#  else
           if (st.n_done.load(std::memory_order_acquire) != st.n_miss)
             YIELD(); // Still waiting on reads to complete
+#  endif
           for (int i = 0; i < st.n_miss; i++)
           {
             bp->install(rows[st.miss_i[i]], st.slot[i]);
@@ -435,6 +491,14 @@ inline void pipeline_teardown<YCSBTransaction>()
     "passes: total=%llu per_tx=%.3f\n",
     static_cast<unsigned long long>(pass_count.load(std::memory_order_relaxed)),
     static_cast<double>(pass_count.load(std::memory_order_relaxed)) / RPC_LOG_SIZE);
+#ifdef SPIN_YIELD
+  printf(
+    "spin: loops=%llu timeouts=%llu denials=%llu budget_ns=%d\n",
+    static_cast<unsigned long long>(n_spin_loops.load(std::memory_order_relaxed)),
+    static_cast<unsigned long long>(n_spin_timeouts.load(std::memory_order_relaxed)),
+    static_cast<unsigned long long>(n_denials.load(std::memory_order_relaxed)),
+    SPIN_BUDGET_NS);
+#endif
   fflush(stdout);
 #endif
 #ifdef SIM_STORAGE
